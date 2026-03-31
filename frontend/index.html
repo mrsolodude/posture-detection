@@ -170,6 +170,13 @@
                 document.getElementById('totalActivities').innerText = hist.length;
                 document.getElementById('alertCount').innerText = alerts.length;
                 
+                // Calculate Average Session Duration
+                if (hist.length > 0) {
+                    const totalDuration = hist.reduce((sum, item) => sum + (item.duration || 0), 0);
+                    const avg = totalDuration / hist.length;
+                    document.getElementById('avgDuration').innerText = avg.toFixed(1) + 's';
+                }
+
                 const alertDiv = document.getElementById('alertLogs');
                 if (alerts.length > 0) {
                     alertDiv.innerHTML = alerts.slice(0, 10).map(a => `
