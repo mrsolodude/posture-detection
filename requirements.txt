@@ -1,0 +1,17 @@
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+ultralytics
+mediapipe
+opencv-python-headless
+pydantic
+twilio
+pyjwt
+passlib[bcrypt]
+python-multipart
+pandas
+scikit-learn
+seaborn
+matplotlib
+joblib

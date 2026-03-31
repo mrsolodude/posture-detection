@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+posture_monitoring.db
+posture_monitoring.db-shm
+posture_monitoring.db-wal
+dataset/
+datasets/
+models/posture_classifier.pkl
+yolo11n-pose.pt

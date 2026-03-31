@@ -1,0 +1,247 @@
+from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, BackgroundTasks, Request
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+import os
+from sqlalchemy.orm import Session
+from datetime import timedelta
+import cv2
+import base64
+import json
+import asyncio
+import re
+from typing import Optional
+from database.models import Base, User, PostureActivity, AlertLog
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from alerts.alert_system import alert_system
+from backend.services.pose_engine import engine
+import bcrypt
+import jwt
+from pydantic import BaseModel
+import time
+import random
+
+# Security configuration
+SECRET_KEY = "SUPER_SECRET_KEY_REPLACE_IN_PROD"
+ALGORITHM = "HS256"
+
+# Database setup
+DATABASE_URL = "sqlite:////Users/apple/Mini Projects/posture new/posture_monitoring.db"
+engine_db = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+# Enable WAL mode for SQLite to prevent locking
+from sqlalchemy import event
+@event.listens_for(engine_db, "connect")
+def set_sqlite_pragma(dbapi_connection, connection_record):
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA journal_mode=WAL")
+    cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.close()
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine_db)
+Base.metadata.create_all(bind=engine_db)
+
+app = FastAPI(title="PostureGuard AI - Backend")
+
+# DASHBOARD EXPLICIT SERVE (Priority)
+@app.get("/")
+async def read_index(request: Request):
+    print(f"Index requested from {request.client.host}")
+    index_path = os.path.join(os.getcwd(), "frontend", "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {"detail": f"Frontend index.html NOT FOUND at {index_path}"}
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pydantic models
+class LoginRequest(BaseModel):
+    phone_number: str
+    password: str
+
+# Shared state
+monitoring_active = False
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# Background task for alert monitoring
+async def alert_monitor_task():
+    global monitoring_active
+    while True:
+        if monitoring_active:
+            db = SessionLocal()
+            try:
+                now = time.time()
+                for track_id, hist in engine.track_history.items():
+                    duration = now - hist["start_time"]
+                    curr_posture = hist["posture"]
+                    
+                    is_incident = False
+                    msg = ""
+                    
+                    # 1. Immediate incident: Falling
+                    if curr_posture == "falling":
+                        if now - hist.get("last_fall_log", 0) > 30: # Log at most every 30s
+                            is_incident = True
+                            msg = f"INCIDENT: Person {track_id} has FALLEN!"
+                            hist["last_fall_log"] = now
+                    
+                    # 2. Prolonged posture incident
+                    elif curr_posture in ["sitting", "bending", "lying down"] and duration >= engine.alert_threshold:
+                        if now - hist["last_alert"] > 600: # Log every 10 mins if still in same posture
+                            is_incident = True
+                            msg = f"INCIDENT: Person {track_id} in '{curr_posture}' for {int(duration/60)}m"
+                            hist["last_alert"] = now
+                    
+                    if is_incident:
+                        log = AlertLog(user_id=None, person_track_id=track_id, posture_type=curr_posture, message=msg)
+                        db.add(log)
+                        db.commit()
+                        print(f"Logged Incident: {msg}")
+            except Exception as e:
+                print(f"Error in incident monitor: {e}")
+            finally:
+                db.close()
+        await asyncio.sleep(5) # check every 5 seconds for incidents
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(alert_monitor_task())
+
+# Registration and login endpoints removed
+
+# Mock OTP storage
+otp_store = {}
+
+@app.post("/request_otp")
+def request_otp(phone_number: str):
+    code = str(random.randint(100000, 999999))
+    otp_store[phone_number] = code
+    # Simulate sending SMS
+    msg = f"Your PostureGuard OTP code is: {code}"
+    alert_system.send_sms(phone_number, msg)
+    return {"message": "OTP sent successfully (Simulated)"}
+
+@app.post("/verify_otp")
+def verify_otp(phone_number: str, code: str):
+    if otp_store.get(phone_number) == code:
+        del otp_store[phone_number]
+        return {"message": "Verification successful"}
+    raise HTTPException(status_code=400, detail="Invalid OTP")
+
+@app.get("/start_monitoring")
+def start_monitoring():
+    global monitoring_active
+    monitoring_active = True
+    return {"status": "Monitoring started"}
+
+@app.get("/stop_monitoring")
+def stop_monitoring():
+    global monitoring_active
+    monitoring_active = False
+    return {"status": "Monitoring stopped"}
+
+@app.get("/history")
+def get_history(db: Session = Depends(get_db)):
+    return db.query(PostureActivity).order_by(PostureActivity.start_time.desc()).limit(100).all()
+
+@app.get("/alerts")
+def get_alerts(db: Session = Depends(get_db)):
+    return db.query(AlertLog).order_by(AlertLog.created_at.desc()).limit(100).all()
+
+@app.websocket("/ws/stream")
+async def websocket_stream(websocket: WebSocket):
+    await websocket.accept()
+    print("Attempting to open camera index 0...")
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("Camera index 0 failed. Trying index 1...")
+        cap = cv2.VideoCapture(1)
+    
+    if not cap.isOpened():
+        print("CRITICAL: No camera detected on indices 0 or 1.")
+        # We can send an error message through the first WS message or just close
+        await websocket.send_text(json.dumps({"error": "Camera hardware unreachable. Please ensure camera permissions are granted."}))
+        await websocket.close()
+        return
+
+    print(f"Camera opened successfully using backend: {cap.getBackendName()}")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame from camera.")
+                break
+            
+            # AI Inference
+            detections = engine.process_frame(frame)
+            
+            # Draw on frame for visualization
+            for d in detections:
+                box = d["box"]
+                cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID: {d['id']} {d['posture']} ({d['duration']}s)", (int(box[0]), int(box[1])-10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # Convert to base64
+            _, buffer = cv2.imencode(".jpg", frame)
+            jpg_as_text = base64.b64encode(buffer).decode("utf-8")
+            
+            # Sync completed sessions to DB
+            if engine.completed_sessions:
+                db = SessionLocal()
+                try:
+                    for ses in engine.completed_sessions[:]: # Copy to safely remove
+                        new_act = PostureActivity(
+                            person_track_id=ses["track_id"],
+                            posture_type=ses["posture"],
+                            start_time=ses["start"],
+                            end_time=ses["end"],
+                            duration=ses["duration"],
+                            confidence=ses["confidence"]
+                        )
+                        db.add(new_act)
+                    db.commit()
+                    engine.completed_sessions.clear()
+                except Exception as ex:
+                    print(f"Sync DB Error: {ex}")
+                finally:
+                    db.close()
+
+            # Send results
+            data = {
+                "frame": jpg_as_text,
+                "detections": detections
+            }
+            await websocket.send_text(json.dumps(data))
+            await asyncio.sleep(0.05) # ~20 FPS limit
+    except Exception as e:
+        print(f"WS Exception: {e}")
+    finally:
+        cap.release()
+        await websocket.close()
+
+
+# Static files should still be available for other assets if any
+try:
+    if os.path.exists("frontend"):
+        app.mount("/static", StaticFiles(directory="frontend"), name="static")
+except:
+    pass
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8080)
