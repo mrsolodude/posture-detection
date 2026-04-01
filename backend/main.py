@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from fastapi import FastAPI, Depends, HTTPException, status, WebSocket, BackgroundTasks, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +26,7 @@ import jwt
 from pydantic import BaseModel
 import time
 import random
+import numpy as np
 
 # Security configuration
 SECRET_KEY = "SUPER_SECRET_KEY_REPLACE_IN_PROD"
@@ -100,10 +105,10 @@ async def alert_monitor_task():
                             hist["last_fall_log"] = now
                     
                     # 2. Prolonged posture incident
-                    elif curr_posture in ["sitting", "bending", "lying down"] and duration >= engine.alert_threshold:
-                        if now - hist["last_alert"] > 600: # Log every 10 mins if still in same posture
+                    elif duration >= engine.alert_threshold:
+                        if now - hist["last_alert"] > 30: # Log every 30s if still in same posture over threshold
                             is_incident = True
-                            msg = f"INCIDENT: Person {track_id} in '{curr_posture}' for {int(duration/60)}m"
+                            msg = f"INCIDENT: Person {track_id} in '{curr_posture}' for {int(duration)}s"
                             hist["last_alert"] = now
                     
                     if is_incident:
@@ -162,29 +167,84 @@ def get_history(db: Session = Depends(get_db)):
 def get_alerts(db: Session = Depends(get_db)):
     return db.query(AlertLog).order_by(AlertLog.created_at.desc()).limit(100).all()
 
+import csv
+from fastapi.responses import StreamingResponse
+import io
+
+@app.get("/download_csv")
+def download_csv(db: Session = Depends(get_db)):
+    # Combine history and alerts
+    history = db.query(PostureActivity).order_by(PostureActivity.start_time.desc()).all()
+    alerts = db.query(AlertLog).order_by(AlertLog.created_at.desc()).all()
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    writer.writerow(["Type", "Person ID", "Posture/Message", "Start Time/Created At", "Duration (s)", "Confidence"])
+    
+    for a in alerts:
+        writer.writerow(["ALERT", a.person_track_id, a.message, a.created_at, "-", "-"])
+        
+    for h in history:
+        writer.writerow(["ACTIVITY", h.person_track_id, h.posture_type, h.start_time, h.duration, h.confidence])
+    
+    output.seek(0)
+    
+    headers = {
+        'Content-Disposition': 'attachment; filename="posture_logs.csv"'
+    }
+    return StreamingResponse(output, media_type="text/csv", headers=headers)
+
 @app.websocket("/ws/stream")
 async def websocket_stream(websocket: WebSocket):
     await websocket.accept()
-    print("Attempting to open camera index 0...")
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Camera index 0 failed. Trying index 1...")
-        cap = cv2.VideoCapture(1)
     
-    if not cap.isOpened():
-        print("CRITICAL: No camera detected on indices 0 or 1.")
-        # We can send an error message through the first WS message or just close
-        await websocket.send_text(json.dumps({"error": "Camera hardware unreachable. Please ensure camera permissions are granted."}))
+    cap = None
+    # 1. Force strict physical laptop camera initialization
+    # Test up to index 3 to bypass iPhone Continuity Camera (which returns pitch-black frames)
+    for index in [0, 1, 2]:
+        print(f"Attempting to open Laptop Camera at index {index}...")
+        temp_cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION) # Force AVFoundation for Mac
+        if not temp_cap.isOpened():
+             temp_cap.release()
+             temp_cap = cv2.VideoCapture(index) # Fallback to default
+             
+        if temp_cap.isOpened():
+            # Warm up and check for totally black frames (Continuity Camera issue)
+            is_valid_cam = False
+            for _ in range(5):
+                ret, frame = temp_cap.read()
+                if ret and frame is not None and np.mean(frame) > 2.0:
+                    is_valid_cam = True
+                    break
+            
+            if is_valid_cam:
+                cap = temp_cap
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                print(f"SUCCESS: Connected to LIVE Laptop Camera at index {index}")
+                break
+            else:
+                print(f"Camera at index {index} is blank or offline. Skipping...")
+        temp_cap.release()
+    
+    if cap is None or not cap.isOpened():
+        error_msg = "CRITICAL: MacOS Blocked Camera Access or Camera is OFF. Please run the server from your own visible Terminal to grant Camera Permissions!"
+        print(error_msg)
+        await websocket.send_text(json.dumps({"error": error_msg}))
         await websocket.close()
         return
 
-    print(f"Camera opened successfully using backend: {cap.getBackendName()}")
+    print(f"Active Camera Backend: {cap.getBackendName()}")
     try:
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("Failed to grab frame from camera.")
+                print("Failed to grab LIVE frame from laptop camera.")
                 break
+                
+            frame = cv2.resize(frame, (640, 480))
             
             # AI Inference
             detections = engine.process_frame(frame)
@@ -192,9 +252,42 @@ async def websocket_stream(websocket: WebSocket):
             # Draw on frame for visualization
             for d in detections:
                 box = d["box"]
-                cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), (0, 255, 0), 2)
-                cv2.putText(frame, f"ID: {d['id']} {d['posture']} ({d['duration']}s)", (int(box[0]), int(box[1])-10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                keypoints = d.get("keypoints", [])
+                is_alert = d["duration"] >= 30 or d["posture"] == "falling"
+                color = (0, 0, 255) if is_alert else (0, 255, 0) # Red if alert, Green if not
+                
+                # HIGH-LEVEL SKELETON REPRESENTATION (Mediapipe-Style)
+                if keypoints:
+                    skeleton_links = [
+                        (15, 13), (13, 11), (16, 14), (14, 12), (11, 12), 
+                        (5, 11), (6, 12), (5, 6), (5, 7), (7, 9), (6, 8), (8, 10),
+                        (1, 2), (0, 1), (0, 2), (1, 3), (2, 4), (3, 5), (4, 6)
+                    ]
+                    # Draw connecting lines
+                    sk_color = (0, 0, 255) if is_alert else (255, 144, 30) # Red for alert, Deep Blue/Cyan for base
+                    for p1_i, p2_i in skeleton_links:
+                        if p1_i < len(keypoints) and p2_i < len(keypoints):
+                            k1, k2 = keypoints[p1_i], keypoints[p2_i]
+                            if k1[2] > 0.4 and k2[2] > 0.4: # Confidence threshold
+                                pt1 = (int(k1[0]), int(k1[1]))
+                                pt2 = (int(k2[0]), int(k2[1]))
+                                cv2.line(frame, pt1, pt2, sk_color, 2)
+                    
+                    # Draw joint nodes
+                    node_color = (0, 0, 255) if is_alert else (0, 255, 255)
+                    for k in keypoints:
+                        if k[2] > 0.4:
+                            cv2.circle(frame, (int(k[0]), int(k[1])), 4, node_color, -1)
+
+                # Draw Bounding Box & Label
+                cv2.rectangle(frame, (int(box[0]), int(box[1])), (int(box[2]), int(box[3])), color, 3 if is_alert else 2)
+                label = f"ID:{d['id']} {d['posture']} ({d['duration']}s)"
+                
+                # Background for text
+                (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+                cv2.rectangle(frame, (int(box[0]), int(box[1]) - 20), (int(box[0]) + w, int(box[1])), color, -1)
+                cv2.putText(frame, label, (int(box[0]), int(box[1])-5), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
             
             # Convert to base64
             _, buffer = cv2.imencode(".jpg", frame)
@@ -227,11 +320,14 @@ async def websocket_stream(websocket: WebSocket):
                 "detections": detections
             }
             await websocket.send_text(json.dumps(data))
-            await asyncio.sleep(0.05) # ~20 FPS limit
+            
+            # Use appropriate sleep cycle to maintain ~30 fps without overwhelming UI
+            await asyncio.sleep(0.001)
     except Exception as e:
         print(f"WS Exception: {e}")
     finally:
-        cap.release()
+        if cap is not None:
+            cap.release()
         await websocket.close()
 
 

@@ -61,6 +61,10 @@
             <div id="statusIndicator" class="flex items-center gap-2 text-sm text-slate-400">
                 <div class="w-2 h-2 rounded-full bg-red-500"></div> System Offline
             </div>
+            <a href="/download_csv" download="posture_logs.csv" class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1 rounded-full text-green-400 transition-all border border-slate-700 flex items-center gap-1">
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg> Export Logs
+            </a>
+            <button onclick="testAlert()" class="text-xs bg-slate-800 hover:bg-slate-700 px-3 py-1 rounded-full text-slate-400 transition-all border border-slate-700">Test Alert</button>
             <button onclick="toggleMonitoring()" id="monitorBtn" class="bg-sky-600 hover:bg-sky-500 px-6 py-2 rounded-full font-semibold transition-all shadow-lg shadow-sky-600/20">Start Monitoring</button>
         </div>
     </nav>
@@ -88,8 +92,8 @@
                             <p class="text-slate-500 text-xs">YOLOv11-Pose + ByteTrack Persistence</p>
                         </div>
                         <div class="text-right">
-                           <p class="text-[10px] text-slate-500 uppercase tracking-widest">Detected Humans</p>
-                           <p class="text-3xl font-orbitron font-bold text-sky-400" id="trackerCount">0</p>
+                            <p class="text-[10px] text-slate-500 uppercase tracking-widest">Detected Humans</p>
+                            <p class="text-3xl font-orbitron font-bold text-sky-400" id="trackerCount">0</p>
                         </div>
                     </div>
                 </div>
@@ -141,7 +145,26 @@
         let isMonitoring = false;
         let ws = null;
         let chart = null;
+        let audioUnlocked = false;
 
+        // Unlock audio on first interaction
+        function unlockAudio() {
+            if (audioUnlocked) return;
+            const alertSound = document.getElementById('alertSound');
+            alertSound.play().then(() => {
+                alertSound.pause();
+                alertSound.currentTime = 0;
+                audioUnlocked = true;
+                console.log("Audio context unlocked");
+            }).catch(e => {
+                console.warn("Audio unlock failed, will retry on trigger.", e);
+            });
+        }
+
+        function testAlert() {
+            unlockAudio();
+            triggerAlarm();
+        }
 
         // CHART LOGIC
         function initChart() {
@@ -175,6 +198,29 @@
                     const totalDuration = hist.reduce((sum, item) => sum + (item.duration || 0), 0);
                     const avg = totalDuration / hist.length;
                     document.getElementById('avgDuration').innerText = avg.toFixed(1) + 's';
+
+                    // Update Chart Data (Group by last 12 Hours)
+                    if (chart) {
+                        const now = new Date();
+                        const hours = Array.from({length: 12}, (_, i) => {
+                            const d = new Date(now);
+                            d.setHours(now.getHours() - (11 - i));
+                            return d.getHours() + ":00";
+                        });
+                        
+                        const counts = new Array(12).fill(0);
+                        hist.forEach(h => {
+                            const hDate = new Date(h.start_time);
+                            const diffHrs = Math.floor((now - hDate) / (1000 * 60 * 60));
+                            if (diffHrs < 12) {
+                                counts[11 - diffHrs]++;
+                            }
+                        });
+                        
+                        chart.data.labels = hours;
+                        chart.data.datasets[0].data = counts;
+                        chart.update();
+                    }
                 }
 
                 const alertDiv = document.getElementById('alertLogs');
@@ -184,11 +230,14 @@
                             <span class="text-red-400 font-bold">${new Date(a.created_at).toLocaleTimeString()}</span>: ${a.message}
                         </div>
                     `).join('');
+                } else {
+                    alertDiv.innerHTML = '<div class="text-slate-600 text-center py-10 text-xs">No incidents logged</div>';
                 }
             } catch (e) { console.error("Error loading history", e); }
         }
 
         async function toggleMonitoring() {
+            unlockAudio(); // Important
             const btn = document.getElementById('monitorBtn');
             const status = document.getElementById('statusIndicator');
             const live = document.getElementById('liveLabel');
@@ -223,30 +272,38 @@
             }
         }
 
-        function startStream() {
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(protocol + '//' + window.location.host + '/ws/stream');
-            let alarmTimeout = null;
-            const alertSound = document.getElementById('alertSound');
-            const alarmOverlay = document.getElementById('alarmOverlay');
+        let alarmTimeout = null;
+        const alertSound = document.getElementById('alertSound');
+        const alarmOverlay = document.getElementById('alarmOverlay');
 
-            function triggerAlarm() {
-                if (!alarmTimeout) {
-                    alertSound.play().catch(e => console.error("Audio play failed, need user interaction first."));
-                    alarmOverlay.style.display = 'block';
-                    alarmTimeout = setTimeout(() => {
-                        stopAlarm();
-                    }, 5000); // Ring for 5 seconds
-                }
+        function triggerAlarm() {
+            if (!alarmTimeout) {
+                console.log("TRIGGERING ALARM");
+                alertSound.volume = 1.0;
+                alertSound.play().catch(e => {
+                    console.error("Audio play failed:", e);
+                    // Still show the overlay even if sound fails
+                });
+                alarmOverlay.style.display = 'block';
+                alarmTimeout = setTimeout(() => {
+                    stopAlarm();
+                }, 5000); // Ring for 5 seconds
             }
+        }
 
-            function stopAlarm() {
-                alertSound.pause();
-                alertSound.currentTime = 0;
-                alarmOverlay.style.display = 'none';
+        function stopAlarm() {
+            alertSound.pause();
+            alertSound.currentTime = 0;
+            alarmOverlay.style.display = 'none';
+            if (alarmTimeout) {
                 clearTimeout(alarmTimeout);
                 alarmTimeout = null;
             }
+        }
+
+        function startStream() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(protocol + '//' + window.location.host + '/ws/stream');
 
             ws.onmessage = (event) => {
                 const data = JSON.parse(event.data);
@@ -263,13 +320,14 @@
                 if (data.detections) {
                     updateTrackers(data.detections);
                     // Trigger alarm if anyone is falling OR someone has been sitting/bending for > threshold
-                    const critical = data.detections.some(d => d.posture === 'falling' || d.duration >= 30); // 30s for demo
+                    const critical = data.detections.some(d => d.posture === 'falling' || d.duration >= 30); // 30s threshold
                     if (critical) triggerAlarm();
                 }
                 
                 if (Math.random() > 0.95) loadData(); // Periodic refresh
             };
         }
+
 
         function updateTrackers(detections) {
             const list = document.getElementById('trackerList');

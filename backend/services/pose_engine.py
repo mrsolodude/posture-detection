@@ -11,18 +11,11 @@ class PostureEngine:
     def __init__(self, model_path='yolo11n-pose.pt'):
         self.model = YOLO(model_path)
         self.track_history = {} # person_id -> {posture: last_posture, start_time: timestamp, last_alert: timestamp}
-        self.alert_threshold = 30 # 30 seconds for testing
+        self.alert_threshold = 30 # 30 seconds threshold
         self.completed_sessions = [] # List of {track_id, posture, start, end, duration, confidence}
         
-        # Load custom classifier if exists
-        self.model_path_clf = 'models/posture_classifier.pkl'
+        # Disabled custom classifier as requested to enforce HIGH LEVEL skeletal math mapping
         self.clf = None
-        if os.path.exists(self.model_path_clf):
-            try:
-                self.clf = joblib.load(self.model_path_clf)
-                print(f"Loaded custom posture classifier: {self.model_path_clf}")
-            except Exception as e:
-                print(f"Failed to load classifier: {e}")
 
     def calculate_angle(self, a, b, c):
         """Calculates the angle between three points (a, b, c) at point b."""
@@ -39,23 +32,7 @@ class PostureEngine:
         return angle
 
     def classify_posture(self, keypoints):
-        """Classifies posture based on skeletal angles or trained classifier."""
-        if self.clf:
-            try:
-                # Prepare features for the MLP model
-                box = [min(keypoints[:,0]), min(keypoints[:,1]), max(keypoints[:,0]), max(keypoints[:,1])]
-                width = max(1, box[2] - box[0])
-                height = max(1, box[3] - box[1])
-                
-                norm_kp = []
-                for p in keypoints:
-                    norm_kp.extend([(p[0] - box[0])/width, (p[1] - box[1])/height, p[2]])
-                
-                prediction = self.clf.predict([norm_kp])[0]
-                return prediction
-            except:
-                pass # fallback to angle logic
-            
+        """Classifies posture purely using high-accuracy skeletal angular mapping."""
         try:
             # Extract relevant keypoints
             l_shoulder = keypoints[5][:2]
@@ -114,8 +91,9 @@ class PostureEngine:
             return "unknown"
 
     def process_frame(self, frame):
-        """Processes a frame, detects people, tracks them, and returns posture data."""
-        results = self.model.track(frame, persist=True, tracker="bytetrack.yaml")
+        """Processes a frame, detects people, tracks them steadily, and returns posture data."""
+        # Removed verbose output to stop terminal spam log, increased confidence for stable high-level ID mapping
+        results = self.model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False, conf=0.45)
         
         current_detections = []
         
@@ -160,6 +138,7 @@ class PostureEngine:
                 current_detections.append({
                     "id": int(track_id),
                     "box": box.tolist(),
+                    "keypoints": kp.tolist(),
                     "posture": posture,
                     "duration": round(duration, 2),
                     "confidence": float(conf)
